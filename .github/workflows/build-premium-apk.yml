@@ -1,0 +1,153 @@
+name: Build Premium APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: true
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply premium patch (overwrite file penuh — robust)
+        run: |
+          cat > lib/api/manager/premium_manager.dart <<'DARTEOF'
+          import 'dart:async';
+          import 'dart:convert';
+          import 'package:GitSync/api/helper.dart';
+          import 'package:GitSync/api/logger.dart';
+          import 'package:GitSync/api/manager/settings_manager.dart';
+          import 'package:GitSync/api/manager/storage.dart';
+          import 'package:GitSync/global.dart';
+          import 'package:flutter/foundation.dart';
+
+          enum GhSponsorCheck { sponsor, notSponsor, notLinked, tokenRejected, unreachable }
+
+          class PremiumManager {
+            final ValueNotifier<bool?> hasPremiumNotifier = ValueNotifier(null);
+
+            Future<void> init() async {
+              await updateGitHubSponsorPremium();
+              final isPremium = await _readPremiumStatus();
+              hasPremiumNotifier.value = isPremium;
+            }
+
+            Future<bool> _readPremiumStatus() async {
+              return true; // [PATCH] premium always on
+            }
+
+            Future<GhSponsorCheck> updateGitHubSponsorPremium() async {
+              await _setGhSponsorPremium(true); // [PATCH] never flip off
+              return GhSponsorCheck.sponsor;
+            }
+
+            Future<void> _setGhSponsorPremium(bool value) async {
+              await repoManager.setBool(StorageKey.repoman_hasGHSponsorPremium, value);
+              hasPremiumNotifier.value = await _readPremiumStatus();
+            }
+
+            Future<bool> cullNonPremium() async {
+              final repomanReponames = await repoManager.getStringList(StorageKey.repoman_repoNames);
+              if (repomanReponames.length > 1) {
+                List.generate(repomanReponames.length - 1, (index) async {
+                  final manager = await SettingsManager().reinit(repoIndex: 1 + index);
+                  await manager.clearAll();
+                });
+                await repoManager.setInt(StorageKey.repoman_repoIndex, 0);
+                await repoManager.setStringList(StorageKey.repoman_repoNames, [repomanReponames[0]]);
+                return true;
+              }
+              return false;
+            }
+
+            void dispose() async {
+              hasPremiumNotifier.dispose();
+            }
+          }
+          DARTEOF
+          echo "=== verify patch ==="
+          grep -n "premium always on" lib/api/manager/premium_manager.dart
+          grep -n "never flip off" lib/api/manager/premium_manager.dart
+
+      - name: Create dummy secrets file
+        run: |
+          cat > lib/constant/secrets.dart <<'EOF'
+          const oauthRedirectUrl = "";
+          const gitHubClientId = "";
+          const gitHubClientSecret = "";
+          const gitHubAppClientId = "";
+          const gitHubAppClientSecret = "";
+          const giteaClientId = "";
+          const gitlabClientId = "";
+          const codebergClientId = "";
+          EOF
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.88.0
+
+      - name: Setup Flutter SDK
+        uses: flutter-actions/setup-flutter@v4
+        with:
+          channel: stable
+          version: 3.35.2
+
+      - name: Set Up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: "temurin"
+          java-version: "21"
+
+      - name: Install flutter_rust_bridge_codegen + cargo-expand
+        run: |
+          cargo install flutter_rust_bridge_codegen --version 2.12.0 --locked
+          cargo install cargo-expand --version 1.0.121 --locked
+
+      - name: Get Packages
+        run: flutter pub get
+
+      - name: Generate Rust bindings
+        run: |
+          flutter_rust_bridge_codegen generate
+          git checkout HEAD -- rust/src/frb_generated.rs || true
+
+      - uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r29-beta4
+
+      - uses: SimonMarquis/android-accept-licenses@v1
+
+      - name: Build APK (arm64)
+        run: |
+          flutter build apk --release --target-platform=android-arm64
+
+      - name: Generate keystore + sign
+        run: |
+          cd build/app/outputs/flutter-apk/
+          keytool -genkeypair -v -keystore ks.jks -keyalg RSA -keysize 2048 \
+            -validity 10000 -alias premium -storepass premium123 -keypass premium123 \
+            -dname "CN=Premium, OU=Dev, O=Local, L=X, S=X, C=ID"
+          $ANDROID_HOME/build-tools/34.0.0/zipalign -f 4 app-release.apk app-aligned.apk
+          $ANDROID_HOME/build-tools/34.0.0/apksigner sign --ks ks.jks \
+            --ks-pass pass:premium123 --key-pass pass:premium123 \
+            --out GitSync-premium-arm64.apk app-aligned.apk
+          ls -la *.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: GitSync-premium-apk
+          path: build/app/outputs/flutter-apk/GitSync-premium-arm64.apk
